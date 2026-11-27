@@ -1,0 +1,769 @@
+"""Discord commands for the DM turn pipeline: !dm/!redo/!start, streaming+batch delivery, TTS speak,
+auto-recap, !wrap, !say/!voice/!voices. Scenes (!ort/!szenen/!ortmodus) and !lore moved to their own
+thin cogs (SceneCog/LoreCog, ADR 039); the automatic <<ORT>> marker drain lives in the delivery
+pipeline (ADR 035). Shared state lives on SessionRuntime (dmbot/runtime.py); cross-cog flow goes
+through its hooks (ADR 029). Bot replies are German; logs English.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from datetime import datetime
+
+from discord.ext import commands
+
+from ..gpu_health import health as gpu_health
+from ..orchestrator import build_intro_director_msg, build_opening_director_msg, turn_user_msg
+from ..llm.intro_guard import is_weak_intro
+from ..tts.textsplit import has_speakable_content, strip_speech_punctuation
+from ..memory import history as history_store
+from ..memory.state import WorldState
+from .delivery import DeliveryPipeline
+from ..runtime import SessionRuntime, _TurnTiming
+
+log = logging.getLogger(__name__)
+
+
+class DMCog(commands.Cog):
+    def __init__(self, bot: commands.Bot, runtime: SessionRuntime) -> None:
+        self.bot = bot
+        self._rt = runtime
+        # The answer→audio delivery pipeline (TTS speak, batch + streaming, scene-marker drain, the
+        # per-turn [latency] line) lives in its own module for context-leanness (ADR 035); the
+        # post-turn tail (autosave / mic re-anchor / auto-recap) stays here, injected as a callback.
+        self._delivery = DeliveryPipeline(runtime, post_deliver=self._post_deliver)
+        runtime.run_and_deliver = self._delivery._run_and_deliver  # hook: DiceCog roll callbacks narrate consequence
+        runtime.auto_dm_turn = self._delivery._auto_dm_turn        # hook: VoiceCog mic release runs a DM turn
+        runtime.speak = self._delivery._speak                      # hook: LoreCog !lore tts reads the compendium aloud
+        self._backend_watch: asyncio.Task | None = None  # posts the failover's table notices (ADR 061)
+        self._resume_turn: asyncio.Task | None = None    # the DM turn answered after a short backend pause
+        self._gpu_watch: asyncio.Task | None = None      # posts the one GPU-fault notice (D125)
+
+    async def cog_load(self) -> None:
+        # Only the failover pair has notices to post; the plain Ollama client has no such event.
+        client = self._rt._brain.client
+        if hasattr(client, "degraded_event"):
+            self._backend_watch = asyncio.create_task(self._watch_backend(client))
+        self._start_gpu_watch()
+
+    async def cog_unload(self) -> None:
+        if self._backend_watch is not None:
+            self._backend_watch.cancel()
+        if self._gpu_watch is not None:
+            self._gpu_watch.cancel()
+            gpu_health.set_listener(None)
+
+    def _start_gpu_watch(self) -> None:
+        """Hook the process-wide GPU latch to the channel: the first CUDA fault in a worker thread
+        sets an event on this loop, and one notice tells the table to restart (D125)."""
+        loop = asyncio.get_running_loop()
+        event = asyncio.Event()
+        gpu_health.set_listener(lambda _source: loop.call_soon_threadsafe(event.set))
+        if gpu_health.broken:  # the fault came before the cog was loaded
+            event.set()
+        self._gpu_watch = asyncio.create_task(self._watch_gpu(event))
+
+    async def _watch_gpu(self, event: asyncio.Event) -> None:
+        await event.wait()
+        notice = gpu_health.notice_de()
+        channel = self._rt._text_channel
+        if channel is None:
+            log.warning("GPU fault (no channel joined yet): %s", notice)
+            return
+        try:
+            await channel.send(notice)
+        except Exception:
+            log.exception("could not post the GPU fault notice")
+
+    async def _watch_backend(self, client) -> None:
+        """Post each backend switch (⚠ degraded / ✅ recovered, ⏸ paused / ▶ back) to the game
+        channel — once per switch, because the failover queues one notice per switch, not per
+        turn (ADR 061).
+
+        In the ``pause`` position this loop is also what notices the return while nobody speaks:
+        it sleeps until the client's next attempt is due, lets the client probe, and — when a
+        short pause ended, by the probe or by a call that got through — starts the DM turn the
+        table is waiting for. When to probe, what the probe is and whether a turn may follow are
+        the client's decisions; whether a turn is waiting is the brain's.
+
+        The turn runs as its own task: this loop's one job stays posting and probing, so a
+        second outage during that turn is announced at once, not after its playback."""
+        retry_in = getattr(client, "retry_in", None)
+        take_resume = getattr(client, "take_resume", None)
+        while True:
+            try:
+                try:
+                    await asyncio.wait_for(client.degraded_event.wait(), retry_in() if retry_in else None)
+                except TimeoutError:
+                    await client.probe()
+                await self._post_backend_notices(client)
+                if take_resume is not None and take_resume():
+                    self._start_waiting_turn()
+            except Exception:
+                log.exception("LLM backend watcher: this round failed — it keeps watching")
+                await asyncio.sleep(1.0)  # never a tight loop on a persistent error
+
+    async def _post_backend_notices(self, client) -> None:
+        for notice in client.take_notices():
+            channel = self._rt._text_channel
+            if channel is None:
+                log.warning("LLM backend notice (no channel joined yet): %s", notice)
+                continue
+            # "Back after a long pause, by a call that got through": if that call was a side call
+            # and a turn still waits, say that the bot waits for the next line.
+            alternative = getattr(notice, "if_waiting", None)
+            if alternative is not None and self._turn_waiting(channel):
+                notice = alternative
+            try:
+                await channel.send(notice)
+            except Exception:
+                log.exception("could not post the LLM backend notice: %s", notice)
+            spoken = getattr(notice, "spoken", "")
+            if spoken:
+                # A fixed sentence, no LLM involved. Best-effort: the chat line above is the notice.
+                try:
+                    await self._rt.speak(spoken, self._guild_id(channel), speech_transform=self._rt.speech_transform())
+                except Exception:
+                    log.exception("could not speak the LLM backend notice")
+
+    @staticmethod
+    def _guild_id(channel) -> int | None:
+        guild = getattr(channel, "guild", None)
+        return guild.id if guild is not None else None
+
+    def _turn_waiting(self, channel) -> bool:
+        return self._rt._brain.waiting_turn(self._rt._brain_channel(channel))
+
+    def _start_waiting_turn(self) -> None:
+        """The backend is back after a short pause: answer what the table said before and during
+        it — the kept player lines, dice results and GM notes — in one DM turn of its own task.
+        Nothing starts when no turn is waiting: the outage hit a side call, or the call that
+        ended the pause is that turn and is being answered already."""
+        channel = self._rt._text_channel
+        if channel is None or not self._turn_waiting(channel):
+            return
+        task = asyncio.create_task(
+            self._delivery._run_and_deliver(channel, self._guild_id(channel), kind="resume")
+        )
+        self._resume_turn = task  # keep a reference; a failure is logged, never raised into the loop
+        task.add_done_callback(self._log_resume_turn)
+
+    @staticmethod
+    def _log_resume_turn(task: asyncio.Task) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            log.error("the DM turn after the backend pause failed", exc_info=task.exception())
+
+    @commands.command(name="backend")
+    async def backend(self, ctx: commands.Context, *, arg: str = "") -> None:
+        """`!backend` — which LLM backend answers (ADR 061). Bare: primary/fallback, whether the
+        pair is degraded and until when, and who answered the last call. `!backend claude` /
+        `!backend ollama` pins that side, `!backend auto` follows the failover again. Applies to
+        this session only, nothing is written to `.env`. With `DM_LLM_ON_FAILURE=pause` a failed
+        primary pauses the game instead of switching; `!backend ollama` is then the deliberate
+        way onto the local model for the rest of the session."""
+        client = self._rt._brain.client
+        if not hasattr(client, "force"):
+            await ctx.send(
+                f"🧠 LLM-Backend: **ollama** ({client.model}) — kein zweites Backend aktiv "
+                "(`DM_LLM_BACKEND=ollama`)."
+            )
+            return
+        status = client.status()
+        wanted = arg.strip().lower()
+        modes = {status.primary: "primary", status.fallback: "fallback", "auto": "auto"}
+        if wanted and wanted not in modes:
+            await ctx.send(
+                f"❓ Unbekannt: `{wanted}` — möglich sind `{status.primary}`, `{status.fallback}`, `auto`."
+            )
+            return
+        if wanted:
+            client.force(modes[wanted])
+            status = client.status()
+        pauses = status.on_failure == "pause"
+        mode = {"auto": "auto (bei Ausfall: Pause)" if pauses else "auto (Failover aktiv)",
+                "primary": f"fest auf {status.primary}",
+                "fallback": f"fest auf {status.fallback}"}[status.mode]
+        if status.paused_since is not None and status.mode == "fallback":
+            # Pinned onto the local model during a pause: it narrates, nothing probes.
+            state = (f"⚠ {status.primary} ausgefallen — {status.fallback} erzählt, solange "
+                     f"`!backend {status.fallback}` gilt — {status.last_error}")
+        elif status.paused_since is not None:
+            since = time.strftime("%H:%M", time.localtime(status.paused_since))
+            retry = time.strftime("%H:%M:%S", time.localtime(status.degraded_until))
+            state = (f"⏸ {status.primary} ausgefallen, Spiel pausiert seit {since}, nächster Versuch "
+                     f"{retry} — {status.last_error}")
+        elif status.degraded_until is not None:
+            until = time.strftime("%H:%M", time.localtime(status.degraded_until))
+            state = f"⚠ {status.primary} ausgefallen, Ersatz bis etwa {until} — {status.last_error}"
+        else:
+            state = "✅ kein Ausfall"
+        await ctx.send("\n".join([
+            f"🧠 **LLM-Backend** — Modus: {mode}",
+            f"Primär: **{status.primary}** ({status.primary_model}) · Ersatz: **{status.fallback}** "
+            f"({status.fallback_model})",
+            f"Zustand: {state}",
+            f"Letzte Antwort von: {status.last_backend or '—'}",
+            f"Ändern: `!backend {status.primary}` · `!backend {status.fallback}` · `!backend auto` "
+            "(gilt nur für diese Sitzung)",
+        ]))
+
+    async def _autosave_turn(self, channel, answer: str, *, user_msg: str | None = None,
+                             redo: bool = False) -> None:
+        """Append the just-completed turn to ``data/sessions/<id>/history.jsonl`` (D41) off the
+        event loop, best-effort. World state persists separately (ADR 015); this is the narrative
+        thread so a crash doesn't lose the evening's conversation.
+
+        ``user_msg`` is the player line the turn's answer carries (``TurnAnswer.user_msg``), never
+        the brain's mutable last turn: this runs after playback, and by then a dice click may
+        have started the next turn (D43) or a compaction
+        cleared it. Without it nothing is journaled — loudly for an answer with content, since
+        that means a delivery path lost the line."""
+        if not self._rt._autosave:
+            return
+        cid = self._rt._brain_channel(channel)
+        if user_msg is None:
+            if answer:
+                log.error("autosave: answer without its player line — not journaled: %r", answer[:80])
+            return
+        # Replay journal (ADR 046): merge the brain's turn capture (lines/results/raw/markers)
+        # and the runtime notes (state_before, scene/flag verdicts, router) into the record.
+        extra = self._rt._brain.take_replay_turn(cid) or {}
+        extra.update(self._rt.take_replay_notes(channel))
+        # In-game clock at turn completion (ADR 053): the chunk-time anchor for the upcoming
+        # session-transcript ingest. Metadata only — no renderer or prompt consumes it, and
+        # every reader must tolerate its absence (old journals lack it).
+        state = self._rt._state.get(cid)
+        if state is not None:
+            extra["time_minutes"] = state.time_minutes
+        try:
+            await asyncio.to_thread(
+                history_store.append_turn, self._rt._history_path(cid),
+                ts=datetime.now().isoformat(timespec="seconds"),
+                user_msg=user_msg, answer=answer, redo=redo, extra=extra or None,
+            )
+        except OSError:
+            log.exception("could not autosave the turn history for channel %s", cid)
+
+    async def _post_deliver(self, channel, answer: str, timing: _TurnTiming, *,
+                            saved_user_msg: str | None, redo: bool) -> None:
+        """The shared end-of-turn tail of both delivery paths, run *after* the answer is spoken and
+        the dice/scene tasks have been awaited: autosave the turn, re-anchor the mic button below the
+        new messages, and run the off-hot-path rolling auto-recap (D56). Identical for the batch and
+        streaming paths — one source of truth. Runs entirely after `/speak` returned, so it never
+        adds turn latency. NOTE: the preceding `timing.end`/`log_line()`/`_await_turn_tasks` step is
+        deliberately kept per-path (batch awaits dice/scene in a `finally` so the 🎲 still posts if
+        speak raised; streaming runs it after the pipeline cleanup) — that placement must not merge."""
+        await self._autosave_turn(channel, answer, user_msg=saved_user_msg, redo=redo)
+        # Keep the mic button reachable: move it back to the bottom after the message + speech.
+        if self._rt._push_to_talk and self._rt._sink is not None:
+            await self._rt.reanchor_mic(channel)
+        # Rolling auto-recap (D56): if this turn's prompt neared the num_ctx cap, compact the history
+        # now — off the hot path (the turn is fully delivered above), so it never adds turn latency.
+        await self._maybe_compact(channel, timing)
+
+    @commands.command(name="dm")
+    async def dm(self, ctx: commands.Context, *, text: str = "") -> None:
+        """Run a DM turn. `!dm` answers the buffered voice lines; `!dm <Text>` answers text."""
+        if self._rt._paused:
+            await ctx.send("⏸ Pausiert — mit **Esc** oder dem ⏸-Knopf fortsetzen.")
+            return
+        channel_id = self._rt._active_vc_id if self._rt._active_vc_id is not None else ctx.channel.id
+        if not text and self._rt._brain.pending_count(channel_id) == 0:
+            await ctx.send(
+                "Nichts zu beantworten — sprecht etwas (nach `!j`) oder nutzt `!dm <Text>`."
+            )
+            return
+        guild_id = ctx.guild.id if ctx.guild else None
+        timing = self._delivery._begin_turn(channel_id)
+        if not self._rt.deliver_seamless() and self._delivery._use_streaming():
+            timing.streamed = True
+            try:
+                async with ctx.typing():
+                    answer = await self._delivery._deliver_streaming(
+                        ctx.channel, guild_id, timing, extra_text=text or None
+                    )
+            except Exception:
+                log.exception("DM turn failed (stream)")
+                await ctx.send("(Der Spielleiter schweigt — Fehler bei der Antwort, siehe Log.)")
+                return
+            if answer is None:  # None = nothing to respond to; "" = a marker-only turn (dice posted)
+                await self._nothing_answered(ctx, channel_id, "(Nichts zu beantworten.)")
+            return
+        try:
+            async with ctx.typing():
+                answer = await self._rt._brain.respond(
+                    channel_id, extra_text=text or None,
+                    check=self._rt.consistency_checker(ctx.channel),
+                )
+                timing.llm_done = time.monotonic()
+                timing.take_llm_stats(self._rt._brain.last_llm_stats)
+        except Exception:
+            log.exception("DM turn failed")
+            await ctx.send("(Der Spielleiter schweigt — Fehler bei der Antwort, siehe Log.)")
+            return
+        if answer is None:
+            await self._nothing_answered(ctx, channel_id, "(Nichts zu beantworten.)")
+            return
+        await self._delivery._deliver_answer(ctx.channel, guild_id, answer, timing)
+
+    async def _nothing_answered(self, ctx: commands.Context, channel_id: int, text: str) -> None:
+        """A turn command came back with no turn. Normally that gets ``text``; while the LLM
+        backend is paused the turn was put aside, the table already has its one ⏸ notice, and the
+        command is only acknowledged with a reaction."""
+        if not self._rt._brain.turn_held(channel_id):
+            await ctx.send(text)
+            return
+        try:
+            await ctx.message.add_reaction("⏸")
+        except Exception:
+            log.debug("could not react to a turn command during the backend pause", exc_info=True)
+
+    @commands.command(name="redo", aliases=["r"])
+    async def redo(self, ctx: commands.Context) -> None:
+        """Re-run the last DM turn with the same input — for when the DM misunderstood. Alias: !r"""
+        if self._rt._paused:
+            await ctx.send("⏸ Pausiert — mit **Esc** oder dem ⏸-Knopf fortsetzen.")
+            return
+        channel_id = self._rt._active_vc_id if self._rt._active_vc_id is not None else ctx.channel.id
+        guild_id = ctx.guild.id if ctx.guild else None
+        timing = self._delivery._begin_turn(channel_id, kind="redo")
+        if not self._rt.deliver_seamless() and self._delivery._use_streaming():
+            timing.streamed = True
+            try:
+                async with ctx.typing():
+                    answer = await self._delivery._deliver_streaming(ctx.channel, guild_id, timing, redo=True)
+            except Exception:
+                log.exception("DM redo failed (stream)")
+                await ctx.send("(Fehler beim Neu-Erzählen, siehe Log.)")
+                return
+            if answer is None:
+                await self._nothing_answered(ctx, channel_id, "Nichts zum Wiederholen — erst eine Runde mit `!dm` spielen.")
+            return
+        try:
+            async with ctx.typing():
+                answer = await self._rt._brain.redo(
+                    channel_id, check=self._rt.consistency_checker(ctx.channel)
+                )
+                timing.llm_done = time.monotonic()
+                timing.take_llm_stats(self._rt._brain.last_llm_stats)
+        except Exception:
+            log.exception("DM redo failed")
+            await ctx.send("(Fehler beim Neu-Erzählen, siehe Log.)")
+            return
+        if answer is None:
+            await self._nothing_answered(ctx, channel_id, "Nichts zum Wiederholen — erst eine Runde mit `!dm` spielen.")
+            return
+        await self._delivery._deliver_answer(ctx.channel, guild_id, answer, timing)
+
+    @commands.command(name="start", aliases=["briefing", "auftrag"])
+    async def start(self, ctx: commands.Context) -> None:
+        """`!start` — the DM speaks the opening briefing so the table knows who they are and what
+        their mission is. First-session complaint: `!join` only prints status lines and never
+        narrates the hook ("hat am Anfang nicht gesagt, was abgeht"). This runs a normal DM turn
+        through the existing generate → stream/speak path (so it's spoken like any other line),
+        driven by a GM-side *director* instruction (orchestrator.build_opening_director_msg) that
+        points the model at the start scene's card. Dice are suppressed for the briefing (the
+        opening turn never queues a <<TEST>>, see DMBrain._prepare_opening)."""
+        if self._rt._paused:
+            await ctx.send("⏸ Pausiert — mit **Esc** oder dem ⏸-Knopf fortsetzen.")
+            return
+        cid = self._rt._brain_channel(ctx.channel)
+        # Mirror the turn-producing guards: a session must be active (state seeded on !join).
+        if self._rt._active_vc_id is None or cid not in self._rt._state:
+            await ctx.send("Keine aktive Sitzung — erst `!j`.")
+            return
+        # Point the scene pointer at the start scene if it isn't set yet, so the prompt's
+        # "## Aktuelle Szene" is the opening scene the briefing should play (deterministic, golden
+        # rule #3 — code moves the pointer, not the model). A loaded session keeps its saved pointer.
+        if self._rt._adventure is not None and not self._rt._state[cid].scene_id:
+            moved = self._rt._set_scene(self._rt._state[cid], self._rt._adventure.start_scene)
+            if moved is not None:
+                self._rt._persist_and_refresh(ctx.channel)
+                await self._rt.update_debug_overlay()  # 🧪 debug overlay (ADR 052)
+                await self._rt.update_player_panel()   # the table's panel (D107)
+        director_msg = build_opening_director_msg()
+        guild_id = ctx.guild.id if ctx.guild else None
+        timing = self._delivery._begin_turn(cid)
+        if not self._rt.deliver_seamless() and self._delivery._use_streaming():
+            timing.streamed = True
+            try:
+                async with ctx.typing():
+                    answer = await self._delivery._deliver_streaming(
+                        ctx.channel, guild_id, timing, opening=director_msg
+                    )
+            except Exception:
+                log.exception("opening briefing failed (stream)")
+                await ctx.send("(Der Spielleiter schweigt — Fehler beim Auftakt, siehe Log.)")
+                return
+            if answer is None:
+                await ctx.send("(Kein Auftakt — siehe Log.)")
+            return
+        try:
+            async with ctx.typing():
+                answer = await self._rt._brain.respond_opening(cid, director_msg)
+                timing.llm_done = time.monotonic()
+                timing.take_llm_stats(self._rt._brain.last_llm_stats)
+        except Exception:
+            log.exception("opening briefing failed")
+            await ctx.send("(Der Spielleiter schweigt — Fehler beim Auftakt, siehe Log.)")
+            return
+        if answer is None:
+            await ctx.send("(Kein Auftakt — siehe Log.)")
+            return
+        await self._delivery._deliver_answer(ctx.channel, guild_id, answer, timing)
+
+    def _speech_status_text(self) -> str:
+        """Current spoken-delivery setting as a short `**mode** + **punct**` string with a per-mode
+        note (the puffer depth, or the nahtlos synth-wait warning)."""
+        if self._rt._speech_mode == "nahtlos":
+            note = " ⏳ wartet auf die volle Synthese vor dem ersten Ton (auf CPU langsam)"
+        elif self._rt._speech_mode == "puffer":
+            note = f" (Vorlauf: {self._rt._speech_prebuffer} Sätze)"
+        else:
+            note = ""
+        return f"**{self._rt._speech_mode}** + **{self._rt._speech_punct}**{note}"
+
+    @commands.command(name="sprechmodus", aliases=["sprache", "voicemode"])
+    async def sprechmodus(self, ctx: commands.Context, *, args: str = "") -> None:
+        """`!sprechmodus` — global spoken-delivery mode for EVERY DM turn (ADR 033). Axes, each set
+        by a word (give any combination, any order); bare `!sprechmodus` just shows the current:
+          • delivery — `stream` (sentence-by-sentence: fast start, small gaps) | `puffer`
+            (stream, but synthesise a few sentences ahead before the first plays: smoother, modest
+            start delay) | `nahtlos` (synth all → one continuous track: gapless, but waits for the
+            WHOLE turn — only snappy on a GPU, see ADR 002);
+          • intonation — `flach` (strip ALL punctuation: no XTTS babble, flatter) |
+            `intoniert` (keep `.,!?;:-` for sentence/question prosody, but XTTS may babble, D55);
+          • a number sets the `puffer` head-start depth (sentences pre-synthesised), e.g.
+            `!sprechmodus puffer 4`.
+        Takes effect on the next turn. `!intro test` stays a fixed nahtlos+flach comparison anchor.
+        Bare `!sprechmodus` (or an unknown word) prints the full how-to + the current setting; a
+        successful change just confirms the new setting."""
+        changed, unknown = False, []
+        for w in args.lower().split():
+            if w in ("stream", "puffer", "nahtlos"):
+                self._rt._speech_mode = w
+                changed = True
+            elif w in ("flach", "intoniert"):
+                self._rt._speech_punct = w
+                changed = True
+            elif w.isdigit():
+                self._rt._speech_prebuffer = max(1, min(20, int(w)))
+                changed = True
+            else:
+                unknown.append(w)
+        # A clean change → just confirm. Bare call or an unknown word → the full how-to + current.
+        if changed and not unknown:
+            await ctx.send(f"🔊 Sprechmodus jetzt: {self._speech_status_text()}")
+            return
+        n = self._rt._speech_prebuffer
+        lines = [
+            "🔊 **Sprechmodus** — wie alle DM-Antworten gesprochen werden (wirkt ab dem nächsten Zug).",
+            f"Aktuell: {self._speech_status_text()}",
+            "",
+            "**Lieferart** — wie abgespielt wird:",
+            "• `stream` — Satz für Satz; schnellster Start, kleine Lücken",
+            f"• `puffer` — erst {n} Sätze vorladen, dann los; glatter, kurze Startverzögerung",
+            "• `nahtlos` — alles am Stück; keine Lücken, wartet aber auf die volle Synthese (auf CPU langsam)",
+            "",
+            "**Betonung** — wie es klingt:",
+            "• `flach` — ohne Satzzeichen; sicher gegen Verhaspler, etwas monoton",
+            "• `intoniert` — mit `.,!?` für Satz-/Fragebetonung (kann selten verhaspeln)",
+            "",
+            "**Ändern:** `!sprechmodus <wert> …` (mehrere auf einmal); eine **Zahl** setzt die Puffertiefe.",
+            "Beispiele: `!sprechmodus nahtlos` · `!sprechmodus puffer 4` · `!sprechmodus stream intoniert`",
+        ]
+        if unknown:
+            lines.insert(0, f"❓ Unbekannt: {', '.join(unknown)} — geänderte Werte sind übernommen.")
+        await ctx.send("\n".join(lines))
+
+    @commands.command(name="intro", aliases=["einleitung", "eroeffnung"])
+    async def intro(self, ctx: commands.Context, *, mode: str = "") -> None:
+        """`!intro` — the DM speaks a full opening *monologue* for the campaign (ADR 031): where the
+        party is, how they got here, what's going on + their mission, and a personal beat for each
+        player character (drawn from each sheet's flavour). Unlike the short `!start` briefing it
+        embeds a character roster into the director instruction and runs on a larger length budget
+        (DM_INTRO_NUM_PREDICT). The scene pointer is moved deterministically (golden rule #3), dice
+        are suppressed. `!start` stays the quick briefing.
+
+        Two delivery modes (same generated monologue), to pick by feel — the trade-off is forced by
+        XTTS being slower than realtime, so you can't have an instant start AND gapless playback:
+        - **`!intro`** (default) — **streamed**, punctuation-free (`strip_speech_punctuation`, no XTTS
+          babble): starts speaking after the first sentence, but synthesis can't keep up with playback
+          so there are small inter-sentence gaps. **Fast start, minor gaps.**
+        - **`!intro test`** — synthesise every sentence, **join them into ONE continuous track** and
+          play it once (`_deliver_intro_chunked`): sounds like one read-aloud text with no gaps, but
+          the first sound waits for the whole monologue to synthesise. **Gapless, slow start.**"""
+        if self._rt._paused:
+            await ctx.send("⏸ Pausiert — mit **Esc** oder dem ⏸-Knopf fortsetzen.")
+            return
+        cid = self._rt._brain_channel(ctx.channel)
+        # Mirror the turn-producing guards: a session must be active (state seeded on !join).
+        if self._rt._active_vc_id is None or cid not in self._rt._state:
+            await ctx.send("Keine aktive Sitzung — erst `!j`.")
+            return
+        # Point the scene pointer at the start scene if it isn't set yet (deterministic, golden rule
+        # #3 — code moves the pointer, not the model), so the prompt's "## Aktuelle Szene" is the
+        # opening scene. A loaded session keeps its saved pointer — the intro never resets progress.
+        if self._rt._adventure is not None and not self._rt._state[cid].scene_id:
+            moved = self._rt._set_scene(self._rt._state[cid], self._rt._adventure.start_scene)
+            if moved is not None:
+                self._rt._persist_and_refresh(ctx.channel)
+                await self._rt.update_debug_overlay()  # 🧪 debug overlay (ADR 052)
+                await self._rt.update_player_panel()   # the table's panel (D107)
+        roster = self._rt._characters.intro_roster_de() if self._rt._characters else ""
+        # The adventure's own plain-language opening (D107): with it the
+        # first part of the monologue is the campaign's text instead of the model's invention,
+        # so a newcomer is not handed two paragraphs of unexplained Warhammer vocabulary.
+        briefing = self._rt._adventure.briefing_de if self._rt._adventure else ""
+        director_msg = build_intro_director_msg(roster, briefing)
+        np = self._rt._intro_num_predict
+        tmp = self._rt._intro_temperature  # lower, fixed !intro temperature (D83) — steadier monologue
+        guild_id = ctx.guild.id if ctx.guild else None
+        timing = self._delivery._begin_turn(cid)
+        # B-variant: batch-generate, then read smaller chunks out one after another (see helper).
+        if mode.strip().lower() == "test":
+            await self._deliver_intro_chunked(ctx, cid, guild_id, director_msg, np, tmp, timing)
+            return
+        if not self._rt.deliver_seamless() and self._delivery._use_streaming():
+            timing.streamed = True
+            try:
+                async with ctx.typing():
+                    answer = await self._delivery._deliver_streaming(
+                        ctx.channel, guild_id, timing, opening=director_msg, opening_num_predict=np,
+                        opening_temperature=tmp,
+                    )
+            except Exception:
+                log.exception("intro monologue failed (stream)")
+                await ctx.send("(Der Spielleiter schweigt — Fehler beim Auftakt, siehe Log.)")
+                return
+            if answer is None:
+                await ctx.send("(Kein Auftakt — siehe Log.)")
+            return
+        try:
+            async with ctx.typing():
+                answer = await self._rt._brain.respond_opening(cid, director_msg, num_predict=np, temperature=tmp)
+                timing.llm_done = time.monotonic()
+                timing.take_llm_stats(self._rt._brain.last_llm_stats)
+        except Exception:
+            log.exception("intro monologue failed")
+            await ctx.send("(Der Spielleiter schweigt — Fehler beim Auftakt, siehe Log.)")
+            return
+        if answer is None:
+            await ctx.send("(Kein Auftakt — siehe Log.)")
+            return
+        await self._delivery._deliver_answer(ctx.channel, guild_id, answer, timing)
+
+    async def _deliver_intro_chunked(self, ctx: commands.Context, cid: int, guild_id: int | None,
+                                     director_msg: str, np: int, tmp: float | None,
+                                     timing: _TurnTiming) -> None:
+        """`!intro test` delivery (ADR 031): generate the whole monologue in one batch (same
+        `respond_opening` path, dice suppressed), post it once, then synthesise each sentence
+        **separately and punctuation-free** (`strip_speech_punctuation`, since XTTS babbles on
+        punctuation, D55) and **join the per-sentence WAVs into ONE continuous track** played in a
+        single bridge call — so the chunked speech sounds like one read-aloud text with natural
+        sentence pacing (a short `_INTRO_SENTENCE_PAUSE_S` silence between sentences) and **no**
+        inter-sentence gaps. Trade-off: the first audio waits for the whole monologue to synthesise
+        (XTTS ~0.5x realtime) — the price of gapless playback. The posted chat text keeps its
+        punctuation (readable, D38). A pause during synthesis aborts cleanly. No dice button / scene
+        proposal (an opening turn never queues either)."""
+        # The batch path can validate the opening before it's spoken: if it comes out weak (too
+        # short / a figure skipped — the 12B model's high-variance failure, ADR 041), regenerate
+        # once. Streaming !intro can't (audio already plays), so this is the path to prefer.
+        roster_names = self._rt._characters.character_names() if self._rt._characters else []
+        try:
+            async with ctx.typing():
+                answer = await self._rt._brain.respond_opening(
+                    cid, director_msg, num_predict=np, temperature=tmp,
+                    is_weak=lambda t: is_weak_intro(t, roster_names),
+                )
+                timing.llm_done = time.monotonic()
+                timing.take_llm_stats(self._rt._brain.last_llm_stats)
+        except Exception:
+            log.exception("intro monologue failed (chunked test)")
+            await ctx.send("(Der Spielleiter schweigt — Fehler beim Auftakt, siehe Log.)")
+            return
+        if not answer or not has_speakable_content(answer):
+            await ctx.send("(Kein Auftakt — siehe Log.)")
+            return
+        log.info("🎭 %s", answer)
+        await self._rt._send_with_retry(ctx.channel, answer)
+        if self._rt._tts_enabled:
+            # `!intro test` = explicit one-off "seamless + punctuation-free", independent of the
+            # global !sprechmodus, as the known-good comparison anchor.
+            await self._delivery._speak_seamless(answer, guild_id, timing, transform=strip_speech_punctuation)
+            timing.end = time.monotonic()
+            timing.log_line()
+        if self._rt._push_to_talk and self._rt._sink is not None:
+            await self._rt.reanchor_mic(ctx.channel)
+        await self._autosave_turn(ctx.channel, answer, user_msg=turn_user_msg(answer))
+
+    @commands.command(name="wrap", aliases=["wrapup"])
+    async def wrap(self, ctx: commands.Context, *, _arg: str = "") -> None:
+        """`!wrap up` / `!wrapup` — generate & store the session recap (D14). It's re-injected at the
+        front of the next session so the story carries over. Non-destructive: play can continue."""
+        cid = self._rt._brain_channel(ctx.channel)
+        await ctx.send("📜 Ich fasse die Sitzung zusammen …")
+        # NPC memory (ADR 044), catch-all for the last scene: the scene-change trigger never fires
+        # for the scene the session ends in, so mine it here BEFORE the recap (awaited — wrap-up is
+        # not latency-critical, and the extractor is best-effort/no-raise by contract). The same
+        # call maintains the Chekhov list (ADR 050) — wrap-up only, threads are session-granularity.
+        state = self._rt._state.get(cid)
+        if state is not None:
+            await self._rt.extract_npc_memories(ctx.channel, state.scene_id, include_chekhov=True)
+        try:
+            # Cumulative, like the rolling auto-recap (D57): fold the recap already in the prompt into
+            # the new one. The auto-recap may have cleared the running history mid-session, so the
+            # visible history alone no longer covers the start — without this the manual wrap-up would
+            # overwrite the stored recap with only the recent tail and lose the earlier part.
+            recap = await self._rt._brain.summarize(cid, prior_recap=self._rt._brain.current_recap(cid))
+        except Exception:
+            log.exception("recap generation failed")
+            await ctx.send("Konnte keine Zusammenfassung erstellen (siehe Log).")
+            return
+        if not recap:
+            await ctx.send("Noch nichts passiert, das sich zusammenfassen ließe.")
+            return
+        self._persist_recap(ctx.channel, recap)
+        # the shared send util splits past Discord's 2000 characters (a recap can be longer)
+        await self._rt._send_with_retry(ctx.channel, f"📜 **Was bisher geschah:**\n{recap}")
+
+    def _persist_recap(self, channel, recap: str) -> None:
+        """Store a freshly generated recap exactly like ``!wrap up``: write it into the world state
+        (state.json via _persist_and_refresh, which also re-injects it into the brain's prompt as
+        ``## Was bisher geschah``) and mirror it to a human-readable recap.md. Shared by ``!wrap up``
+        and the rolling auto-recap (D56) so both persist it identically and it survives a restart."""
+        cid = self._rt._brain_channel(channel)
+        state = self._rt._state.get(cid)
+        if state is None:
+            return
+        state.set_recap(recap)
+        self._rt._persist_and_refresh(channel)
+        try:  # mirror to a human-readable recap.md beside state.json (recap.debug.md on a debug run)
+            self._rt.session_file(cid, "recap", "md").write_text(recap + "\n", encoding="utf-8")
+        except OSError:
+            log.exception("could not write recap.md")
+
+    async def _maybe_compact(self, channel, timing: _TurnTiming) -> None:
+        """Rolling auto-recap / context handoff (D56). Called AFTER a turn has been delivered/spoken
+        (off the hot path, modelled on _autosave_turn) — never adds latency to the current turn.
+
+        When the just-finished turn's prompt neared the num_ctx cap, fold the running history into a
+        **cumulative** recap (prior recap + recent history → one new recap that supersedes it),
+        persist it like ``!wrap up`` (so it survives a restart and is injected next turn), then clear
+        the in-memory history. The next prompt = persona + adventure + recap + state + empty
+        history — safely under budget, so the persona/adventure head is never truncated again.
+        With the autosave on, a compaction event in the journal tells the crash restore which
+        turns the recap now holds (:meth:`_journal_compaction`).
+
+        A per-channel guard stops two quick turns both compacting and stops the next player turn from
+        reading half-cleared history. After compaction the history is small, so it won't re-trigger."""
+        if not self._rt._autorecap or not timing.ctx_over_budget():
+            return
+        cid = self._rt._brain_channel(channel)
+        if cid in self._rt._compacting or self._rt._state.get(cid) is None:
+            return
+        if self._rt._brain.history_len(cid) == 0:  # nothing to fold in (e.g. fresh after a prior compaction)
+            return
+        self._rt._compacting.add(cid)
+        try:
+            log.info(
+                "🧵 Kontext bei %s/%s — Auto-Recap: history wird kompaktiert (Persona/Abenteuer "
+                "bleiben so ungekürzt).", timing.prompt_eval, timing.num_ctx,
+            )
+            # Cumulative: fold the recap currently in the prompt into the new one — it is what covers
+            # the turns that scrolled out of the running history. The model condenses it to hold
+            # the recap's length (memory/recap.py).
+            prior = self._rt._brain.current_recap(cid)
+            # Journal mark, taken with no await before the summary starts: what the autosave holds
+            # up to here is what this recap will cover; a turn autosaved while the LLM summarises
+            # is not, and the compaction event below tells the crash restore to keep it.
+            journal = self._rt._history_path(cid) if self._rt._autosave else None
+            mark = history_store.journal_size(journal) if journal is not None else 0
+            recap = await self._rt._brain.summarize(cid, prior_recap=prior)
+            if not recap:
+                log.warning("🧵 Auto-Recap: leere Zusammenfassung — history NICHT geleert.")
+                return
+            # The text itself, debug.log only (🪵, like the raw answer): from here on it stands
+            # where the history stood, and a later turn cannot be rebuilt without it.
+            log.info("🪵 Auto-Recap (%d Zeichen): %s", len(recap), recap.replace("\n", " ⏎ "))
+            self._persist_recap(channel, recap)
+            # Reset the rolling history only now that the recap is safely persisted (clear_history
+            # keeps recap/state/buffer — only the turn-by-turn thread goes).
+            self._rt._brain.clear_history(cid)
+            # NPC-memory window (ADR 044): the mark counted from the old history head; after the
+            # compaction only the turns appended during the summarize await remain, so restart the
+            # window at 0. Overlap (extracted-but-unconsumed turns) is deduped at apply.
+            self._rt._npc_mem_marks.pop(cid, None)
+            if journal is not None:
+                # Without this event a restart restores the compacted turns on top of the recap
+                # that holds them (D136). A failed write only costs that again.
+                try:
+                    await asyncio.to_thread(self._journal_compaction, cid, journal, recap, mark)
+                except OSError:
+                    log.exception("could not journal the compaction for channel %s", cid)
+            log.info("🧵 Auto-Recap fertig — history kompaktiert, Recap aktualisiert.")
+            if self._rt._text_channel is not None:  # a brief, lightweight Discord note (matches status posts)
+                await self._rt._send_with_retry(
+                    self._rt._text_channel,
+                    "🧵 Kontext wurde eng — ich habe das Bisherige zusammengefasst und mache nahtlos "
+                    "weiter (Persona & Abenteuer bleiben erhalten).",
+                )
+        except Exception:
+            log.exception("🧵 Auto-Recap failed — keeping the running history (no truncation safety lost)")
+        finally:
+            self._rt._compacting.discard(cid)
+
+    def _journal_compaction(self, cid: int, journal, recap: str, mark: int) -> None:
+        """Write the compaction event — but only once the new recap is really in ``state.json``.
+        The event tells a restart "the recap holds these turns"; ``_persist_recap`` returns
+        silently when the state is gone (a ``!leave`` during the summary) and a failed state save
+        is only logged, and in both cases the turns must still come back from the journal.
+        Runs in a worker thread (file I/O)."""
+        saved = WorldState.load(self._rt._state_path(cid))
+        if saved is None or saved.recap != recap.strip():
+            log.warning("🧵 auto-recap: the new recap is not in state.json — no compaction event "
+                        "written; a restart restores the compacted turns from the journal")
+            return
+        kept = history_store.append_compaction(
+            journal, ts=datetime.now().isoformat(timespec="seconds"), since=mark,
+        )
+        if kept is None:
+            log.info("🧵 auto-recap: the journal was rotated meanwhile — no compaction event written")
+
+    @commands.command(name="say")
+    async def say(self, ctx: commands.Context, *, text: str) -> None:
+        """Speak arbitrary text through Piper + Bot A — a TTS/bridge smoke test."""
+        if not self._rt._tts_enabled:
+            await ctx.send("Keine TTS-Stimme geladen (siehe SETUP B5).")
+            return
+        if await self._delivery._speak(text, ctx.guild.id if ctx.guild else None):
+            await ctx.send("🔊")
+        else:
+            await ctx.send(
+                "Konnte nicht abspielen — läuft **Bot A** und ist es im selben Voice-Channel? "
+                "Prüfe `!vstatus`; Details im Log (`logs/debug.log`)."
+            )
+
+    @commands.command(name="voice")
+    async def voice(self, ctx: commands.Context, *, name: str = "") -> None:
+        """Switch the XTTS speaker live: `!voice Dionisio Schuyler`. No arg → show current."""
+        if not hasattr(self._rt._tts, "set_speaker"):
+            await ctx.send("Sprecher-Wechsel geht nur mit `TTS_ENGINE=xtts`.")
+            return
+        if not name:
+            await ctx.send(f"Aktueller Sprecher: **{self._rt._tts.speaker}**")
+            return
+        if self._rt._tts.set_speaker(name):
+            await ctx.send(f"Sprecher → **{name}**. Teste mit `!say …`.")
+        else:
+            await ctx.send(f"Unbekannter Sprecher `{name}`. Liste: `!voices`.")
+
+    @commands.command(name="voices")
+    async def voices(self, ctx: commands.Context) -> None:
+        """List the XTTS built-in speakers."""
+        if not hasattr(self._rt._tts, "speakers"):
+            await ctx.send("Nur mit `TTS_ENGINE=xtts` verfügbar.")
+            return
+        names = ", ".join(self._rt._tts.speakers())
+        await ctx.send(f"**XTTS-Sprecher:**\n{names[:1900]}")
