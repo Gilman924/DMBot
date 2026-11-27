@@ -1,0 +1,148 @@
+﻿
+  dmbot\llm\client.py:188:            "num_ctx": payload["options"].get("num_ctx"),
+  dmbot\llm\client.py:189:        }
+  dmbot\llm\client.py:190:        return data["message"]["content"].strip()
+  dmbot\llm\client.py:191:
+  dmbot\llm\client.py:192:
+> dmbot\llm\client.py:193:    async def chat_with_tools(
+  dmbot\llm\client.py:194:        self,
+  dmbot\llm\client.py:195:        system: str,
+  dmbot\llm\client.py:196:        messages: list[dict[str, str]],
+  dmbot\llm\client.py:197:        tools: list[dict],
+  dmbot\llm\client.py:198:        *,
+  dmbot\llm\client.py:199:        options: dict | None = None,
+  dmbot\llm\client.py:200:    ) -> dict:
+  dmbot\llm\client.py:201:        """One Ollama chat request with native tool calling."""
+  dmbot\llm\client.py:202:        payload = {
+  dmbot\llm\client.py:203:            "model": self._model,
+  dmbot\llm\client.py:204:            "stream": False,
+  dmbot\llm\client.py:205:            "keep_alive": self._keep_alive,
+  dmbot\llm\client.py:206:            "messages": [
+  dmbot\llm\client.py:207:                {"role": "system", "content": system},
+  dmbot\llm\client.py:208:                *messages,
+  dmbot\llm\client.py:209:            ],
+  dmbot\llm\client.py:210:            "tools": tools,
+  dmbot\llm\client.py:211:            "options": self._merged_options(options),
+  dmbot\llm\client.py:212:        }
+  dmbot\llm\client.py:213:
+  dmbot\llm\client.py:214:        resp = await self._client.post(
+  dmbot\llm\client.py:215:            f"{self._host}/api/chat",
+  dmbot\llm\client.py:216:            json=payload,
+  dmbot\llm\client.py:217:        )
+  dmbot\llm\client.py:218:        resp.raise_for_status()
+  dmbot\llm\client.py:219:        data = resp.json()
+  dmbot\llm\client.py:220:
+  dmbot\llm\client.py:221:        self.last_stats = {
+  dmbot\llm\client.py:222:            "prompt_eval_count": data.get("prompt_eval_count"),
+  dmbot\llm\client.py:223:            "eval_count": data.get("eval_count"),
+  dmbot\llm\client.py:224:            "num_ctx": payload["options"].get("num_ctx"),
+  dmbot\llm\client.py:225:        }
+  dmbot\llm\client.py:226:
+  dmbot\llm\client.py:227:        return data["message"]
+  dmbot\llm\client.py:228:
+  dmbot\llm\client.py:229:    async def chat_stream(
+  dmbot\llm\client.py:230:        self,
+  dmbot\llm\client.py:231:        system: str,
+  dmbot\llm\client.py:232:        messages: list[dict[str, str]],
+  dmbot\llm\client.py:233:        *,
+  dmbot\llm\client.py:234:        options: dict | None = None,
+  dmbot\llm\client.py:235:    ) -> AsyncIterator[str]:
+  dmbot\llm\client.py:236:        """Like :meth:`chat`, but stream the answer as text deltas 
+(``stream: true``).
+  dmbot\llm\client.py:237:
+  dmbot\llm\client.py:238:        Yields each ``message.content`` delta as it arrives, so the DM 
+turn can synthesise +
+  dmbot\llm\client.py:239:        speak the first sentence while the rest is still generating (ADR 
+017). ``last_stats`` is
+  dmbot\llm\client.py:240:        set from the terminal ``done`` object, same shape as :meth:`chat`. 
+The caller stops the
+  dmbot\llm\client.py:241:        generation early simply by stopping iteration / calling ``aclose`` 
+on this generator —
+  dmbot\llm\client.py:242:        httpx closes the underlying stream (the client-side stop-label 
+abort). Server-side
+  dmbot\llm\client.py:243:        ``options.stop`` still applies. Raises ``httpx.HTTPError`` on 
+transport/HTTP failure.
+  dmbot\llm\client.py:244:        """
+  dmbot\llm\client.py:245:        payload = {
+  dmbot\llm\client.py:246:            "model": self._model,
+  dmbot\llm\client.py:247:            "stream": True,
+  dmbot\llm\client.py:248:            "keep_alive": self._keep_alive,
+  dmbot\llm\client.py:249:            "messages": [{"role": "system", "content": system}, *messages],
+  dmbot\llm\client.py:250:            "options": self._merged_options(options),
+  dmbot\llm\client.py:251:        }
+  dmbot\llm\client.py:252:        num_ctx = payload["options"].get("num_ctx")
+  dmbot\llm\client.py:253:        # Generous read timeout for the stream: the first delta can take 
+minutes on a cold start
+  dmbot\llm\failover.py:430:        if format is None:
+  dmbot\llm\failover.py:431:            self._narrated = self._fallback
+  dmbot\llm\failover.py:432:        return answer
+  dmbot\llm\failover.py:433:
+  dmbot\llm\failover.py:434:
+> dmbot\llm\failover.py:435:    async def chat_with_tools(
+  dmbot\llm\failover.py:436:        self,
+  dmbot\llm\failover.py:437:        system: str,
+  dmbot\llm\failover.py:438:        messages: list[dict[str, str]],
+  dmbot\llm\failover.py:439:        tools: list[dict],
+  dmbot\llm\failover.py:440:        *,
+  dmbot\llm\failover.py:441:        options: dict | None = None,
+  dmbot\llm\failover.py:442:    ) -> dict:
+  dmbot\llm\failover.py:443:        """Chat with tools, preserving the normal failover behavior."""
+  dmbot\llm\failover.py:444:        if self._asks_primary(schema=False):
+  dmbot\llm\failover.py:445:            started_under = self._degrades
+  dmbot\llm\failover.py:446:            try:
+  dmbot\llm\failover.py:447:                answer = await self._primary.chat_with_tools(
+  dmbot\llm\failover.py:448:                    system, messages, tools, options=options
+  dmbot\llm\failover.py:449:                )
+  dmbot\llm\failover.py:450:            except LLMBackendError as exc:
+  dmbot\llm\failover.py:451:                self._primary_failed(exc, started_under, schema=False)
+  dmbot\llm\failover.py:452:                if self._on_failure == "pause":
+  dmbot\llm\failover.py:453:                    raise self._paused_error() from exc
+  dmbot\llm\failover.py:454:            else:
+  dmbot\llm\failover.py:455:                self._primary_answered(started_under)
+  dmbot\llm\failover.py:456:                self._answered = self._narrated = self._primary
+  dmbot\llm\failover.py:457:                return answer
+  dmbot\llm\failover.py:458:        elif self._holds():
+  dmbot\llm\failover.py:459:            raise self._paused_error()
+  dmbot\llm\failover.py:460:
+  dmbot\llm\failover.py:461:        self._answered = self._narrated = self._fallback
+  dmbot\llm\failover.py:462:        return await self._fallback.chat_with_tools(
+  dmbot\llm\failover.py:463:            system, messages, tools, options=options
+  dmbot\llm\failover.py:464:        )
+  dmbot\llm\failover.py:465:
+  dmbot\llm\failover.py:466:    async def chat_stream(
+  dmbot\llm\failover.py:467:        self,
+  dmbot\llm\failover.py:468:        system: str,
+  dmbot\llm\failover.py:469:        messages: list[dict[str, str]],
+  dmbot\llm\failover.py:470:        *,
+  dmbot\llm\failover.py:471:        options: dict | None = None,
+  dmbot\llm\failover.py:472:    ) -> AsyncIterator[str]:
+  dmbot\llm\failover.py:473:        if self._asks_primary(schema=False):
+  dmbot\llm\failover.py:474:            started_under = self._degrades
+  dmbot\llm\failover.py:475:            self._answered = self._narrated = self._primary
+  dmbot\llm\failover.py:476:            stream = self._primary.chat_stream(system, messages, 
+options=options)
+  dmbot\llm\failover.py:477:            yielded = False
+  dmbot\llm\failover.py:478:            try:
+  dmbot\llm\failover.py:479:                try:
+  dmbot\llm\failover.py:480:                    async for delta in stream:
+  dmbot\llm\failover.py:481:                        if not yielded:
+  dmbot\llm\failover.py:482:                            yielded = True
+  dmbot\llm\failover.py:483:                            self._primary_answered(started_under)  # a 
+first delta is proof enough of recovery
+  dmbot\llm\failover.py:484:                        yield delta
+  dmbot\llm\failover.py:485:                finally:
+  dmbot\llm\failover.py:486:                    # Also reached when OUR consumer closes early (pause 
+/ speaker-label abort):
+  dmbot\llm\failover.py:487:                    # the close has to travel down to the backend's 
+stream.
+  dmbot\llm\failover.py:488:                    await stream.aclose()
+  dmbot\llm\failover.py:489:            except LLMBackendError as exc:
+  dmbot\llm\failover.py:490:                self._primary_failed(exc, started_under, schema=False)
+  dmbot\llm\failover.py:491:                if yielded:
+  dmbot\llm\failover.py:492:                    raise  # text is out and may be spoken — no second 
+answer on top of it
+  dmbot\llm\failover.py:493:                if self._on_failure == "pause":
+  dmbot\llm\failover.py:494:                    raise self._paused_error() from exc
+  dmbot\llm\failover.py:495:            else:
+
+
