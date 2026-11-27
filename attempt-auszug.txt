@@ -1,0 +1,40 @@
+﻿
+  dmbot\orchestrator.py:223:
+  dmbot\orchestrator.py:224:
+  dmbot\orchestrator.py:225:@dataclass
+> dmbot\orchestrator.py:226:class _Attempt:
+  dmbot\orchestrator.py:227:    """One LLM call's outcome, batch or streamed: the sanitised answer 
+and its parsed markers.
+  dmbot\orchestrator.py:228:    A streamed attempt also says what it still holds back 
+(``remaining``, not spoken yet),
+  dmbot\orchestrator.py:229:    whether it spoke anything and whether the stream broke 
+mid-generation."""
+  dmbot\orchestrator.py:230:
+  dmbot\orchestrator.py:231:    answer: str
+  dmbot\orchestrator.py:232:    markers: dict[str, list]
+> dmbot\orchestrator.py:233:    remaining: list[str] = field(default_factory=list)
+  dmbot\orchestrator.py:234:    spoke_any: bool = False
+  dmbot\orchestrator.py:235:    errored: bool = False
+  dmbot\orchestrator.py:236:
+  dmbot\orchestrator.py:237:
+  dmbot\orchestrator.py:238:class DMBrain:
+  dmbot\orchestrator.py:239:    """Per-channel history + a pending-player-lines buffer, driving one 
+LLM client."""
+  dmbot\orchestrator.py:240:
+  dmbot\orchestrator.py:241:    def __init__(
+  dmbot\orchestrator.py:1086:            # for the tuning loop (W4 visibility).
+  dmbot\orchestrator.py:1087:            log.warning("echo guard: streamed answer re-narrated the 
+previous one (already spoken)")
+  dmbot\orchestrator.py:1088:        if sink is not None:
+> dmbot\orchestrator.py:1089:            for sentence in remaining:
+  dmbot\orchestrator.py:1090:                if sink.should_abort is not None and 
+sink.should_abort():
+  dmbot\orchestrator.py:1091:                    break
+  dmbot\orchestrator.py:1092:                if has_speakable_content(sentence):
+  dmbot\orchestrator.py:1093:                    await sink.on_sentence(sentence)
+  dmbot\orchestrator.py:1094:        self._queue_markers(session, markers)
+  dmbot\orchestrator.py:1095:        return (None if suppressed else answer), attempt.errored
+  dmbot\orchestrator.py:1096:
+  dmbot\orchestrator.py:1097:    async def _run_turn(
+
+
