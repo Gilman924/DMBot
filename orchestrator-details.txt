@@ -1,0 +1,234 @@
+﻿    async def _chat_once(
+        self,
+        session: ChannelSession,
+        user_msg: str,
+        labels: list[str],
+        history_prefix: list[dict[str, str]],
+        num_predict: int | None = None,
+        temperature: float | None = None,
+    ) -> tuple[str, dict[str, list]]:
+        """One non-streaming LLM call, with Nat20 tool execution in D&D mode."""
+        import json
+
+        system, messages, options = self._build_request(
+            session, user_msg, labels, history_prefix,
+            num_predict=num_predict, temperature=temperature,
+        )
+
+        raw = ""
+
+        with caller_reports_cut():
+            if self._nat20 is not None and hasattr(self._client, "chat_with_tools"):
+                tool_messages = list(messages)
+
+                for _ in range(4):
+                    response = await self._client.chat_with_tools(
+                        system,
+                        tool_messages,
+                        self._NAT20_TOOLS,
+                        options=options,
+                    )
+
+                    content = response.get("content") or ""
+                    tool_calls = response.get("tool_calls") or []
+
+                    # Mistral Nemo liefert Werkzeugaufrufe teilweise als JSON-Text.
+                    if not tool_calls and content:
+                        try:
+                            parsed = json.loads(content)
+                            if isinstance(parsed, list):
+                                allowed = {
+                                    tool["function"]["name"]
+                                    for tool in self._NAT20_TOOLS
+                                }
+                                tool_calls = [
+                                    {
+                                        "function": {
+                                            "name": item["name"],
+                                            "arguments": item.get("arguments") or {},
+                                        }
+                                    }
+                                    for item in parsed
+                                    if isinstance(item, dict)
+                                    and item.get("name") in allowed
+                                ]
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+
+                    if not tool_calls:
+                        raw = content
+                        break
+
+                    tool_messages.append({
+                        "role": "assistant",
+                        "content": content,
+                        "tool_calls": tool_calls,
+                    })
+
+
+                    for call in tool_calls:
+                        function = call.get("function", {})
+                        name = function.get("name")
+                        arguments = function.get("arguments") or {}
+
+                        try:
+                            if name == "nat20_health":
+                                result = await self._nat20.health()
+                            elif name == "nat20_start_combat":
+                                result = await self._nat20.start_combat(
+                                    party=arguments["party"],
+                                    monsters=arguments["monsters"],
+                                )
+                            elif name == "nat20_get_combat":
+                                result = await self._nat20.get_combat(
+                                    arguments["combat_id"]
+                                )
+                            elif name == "nat20_submit_intent":
+                                result = await self._nat20.submit_intent(
+                                    arguments["combat_id"],
+                                    arguments["intent"],
+                                )
+                            elif name == "nat20_advance_monster":
+                                result = await self._nat20.advance_monster(
+                                    arguments["combat_id"]
+                                )
+                            elif name == "nat20_end_combat":
+                                result = await self._nat20.end_combat(
+                                    arguments["combat_id"]
+                                )
+                            else:
+                                result = {"error": f"Unbekanntes Werkzeug: {name}"}
+                        except Exception as exc:
+
+                            result = {"error": str(exc)}
+
+                        tool_messages.append({
+                            "role": "tool",
+                            "tool_name": name or "unknown",
+                            "content": json.dumps(result, ensure_ascii=False),
+                        })
+                else:
+                    raw = "Ich konnte die Regelengine nach mehreren Werkzeugaufrufen nicht abschlieÃŸen."
+
+            else:
+                raw = await self._client.chat(system, messages, options=options)
+
+        self.last_llm_stats = self._client.last_stats
+        log.info("ðŸªµ LLM roh: %s", raw.replace("\n", " âŽ® "))
+        session.replay_gen = {"raw": raw}
+        answer, markers, dropped = finalize_answer_trimmed(
+            raw, labels, self._profile
+        )
+        self._log_cut(dropped)
+        return answer, markers
+
+
+    @staticmethod
+    def _answer_problem(answer: str, user_msg: str, prev_answer: str) -> tuple[str, str] | None:
+        """``(log label, retry nudge)`` when the answer parrots a player line (D43/ADR 018) or
+        re-narrates the DM's own previous answer (W4/ADR 019); ``None`` when the answer is fine."""
+        if not answer:
+            return None
+        if is_echo(answer, user_msg):
+            return "parrots a player line", _ECHO_NUDGE
+        if is_self_repetition(answer, prev_answer):
+            return "re-narrates the previous answer", _REPEAT_NUDGE
+        return None
+
+    @staticmethod
+    def _prev_answer(history_prefix: list[dict[str, str]]) -> str:
+        """The DM's most recent stored answer (for the self-repetition check), or ''."""
+        if history_prefix and history_prefix[-1].get("role") == "assistant":
+            return history_prefix[-1].get("content", "")
+        return ""
+
+    async def _stream_once(
+        self,
+        session: ChannelSession,
+        user_msg: str,
+        labels: list[str],
+        history_prefix: list[dict[str, str]],
+        sink: _Sink,
+        num_predict: int | None = None,
+
+        )
+
+    async def _guarded_answer(
+        self,
+        session: ChannelSession,
+        user_msg: str,
+        labels: list[str],
+        history_prefix: list[dict[str, str]],
+        *,
+        sink: _Sink | None = None,
+        num_predict: int | None = None,
+        temperature: float | None = None,
+    ) -> tuple[str | None, bool]:
+        """One DM answer for ``user_msg`` behind the echo guard (D43/ADR 018 + W4) â€” the single
+        generation path of every turn. ``sink=None`` asks the LLM in one batch call
+        (:meth:`_chat_once`); with a sink the first attempt streams (:meth:`_stream_once`).
+
+        If the answer merely parrots a player line or re-narrates the DM's own previous answer,
+        retry once with a corrective nudge â€” always a plain batch call, the corrective rare path.
+        If the retry misfires again the turn is suppressed: nothing spoken, nothing stored
+        (degenerate turns in history self-reinforce). A streamed attempt is
+        only retried while nothing was spoken â€” an echo/repetition is held back by the assembler's
+        last-sentence rule for short answers; a half-spoken or errored turn is never retried.
+
+        Speaks what a streamed turn still holds back and queues the kept answer's markers.
+        Returns ``(answer, errored)``: ``answer`` is ``None`` for a suppressed turn, ``errored``
+        says the stream broke mid-generation."""
+        streaming = sink is not None
+        prev = self._prev_answer(history_prefix)
+        if sink is None or (
+            self._nat20 is not None
+            and self._profile is None
+        ):
+            attempt = _Attempt(*await self._chat_once(
+                session, user_msg, labels, history_prefix,
+                num_predict=num_predict, temperature=temperature,
+            ))
+        else:
+            attempt = await self._stream_once(
+                session, user_msg, labels, history_prefix, sink,
+                num_predict=num_predict, temperature=temperature,
+            )
+            prev = self._prev_answer(history_prefix)
+            if sink is not None:
+                await sink(answer=attempt.answer)
+        answer, markers, remaining = attempt.answer, attempt.markers, attempt.remaining
+        suppressed = False
+        problem = None if (attempt.errored or attempt.spoke_any) else self._answer_problem(answer, user_msg, prev)
+        if problem is not None:
+            label, nudge = problem
+            log.warning("echo guard%s: answer %s (%r) â€” retrying once", " (stream)" if streaming else "", label, answer)
+            nudged = f"{user_msg}\n{nudge}"
+            try:
+                answer, markers = await self._chat_once(session, nudged, labels, history_prefix, num_predict=num_predict, temperature=temperature)
+            except LLMPausedError:
+                raise  # nothing was spoken (a retry only happens then) â€” the turn is put aside, not suppressed
+            except Exception:
+                if not streaming:
+                    raise  # a batch turn has always let a failed retry propagate
+                log.exception("echo-guard retry failed â€” suppressing the turn")
+                answer, markers = "", empty_markers()
+            if self._answer_problem(answer, user_msg, prev) is not None:
+                log.warning("echo guard: the retry misfired again â€” suppressing the turn")
+                if not streaming:
+                    # Kept deviation: a suppressed batch turn leaves here, before _queue_markers,
+                    # so its replay capture has no "markers" key, while a suppressed streamed
+                    # turn goes on and records empty markers. Why: aligning the two would change
+                    # what the replay journal (ADR 046) records, and this split changes nothing.
+                    return None, False
+                answer, markers = "", empty_markers()
+            suppressed = streaming and not answer
+            remaining = [answer] if answer else []
+        elif attempt.spoke_any and not attempt.errored and is_self_repetition(answer, prev):
+            # A long repetition streams sentence-by-sentence before finish() can judge it â€” too
+            # late to retract audio. Keep history parity (stored == spoken) but flag it loudly
+            # for the tuning loop (W4 visibility).
+            log.warning("echo guard: streamed answer re-narrated the previous one (already spoken)")
+        if sink is not None:
+            for sentence in remaining:
+                if sink.should_abort is not None and sink.should_abort():
+                    break
